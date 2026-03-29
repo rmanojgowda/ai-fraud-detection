@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+data/creditcard.csv
+logs/
+models/fraud_model.pkl
+Thumbs.db
+.vscode/
+*.tmp
