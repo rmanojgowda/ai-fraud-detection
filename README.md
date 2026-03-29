@@ -324,7 +324,7 @@ In-memory limits only work per process. With 4 workers, each worker would have i
 
 **Manoj Gowda BG**
 B.E. Information Science & Engineering
-Siddaganga Institute of Technology, Bangalore (2026)
+Siddaganga Institute of Technology, Tumkur (2026)
 
 Built to demonstrate production-grade fraud detection engineering,
 not just ML model training.
