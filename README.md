@@ -1,4 +1,6 @@
 # 🛡️ AI-Based Real-Time Credit Card Fraud Detection System
+## 🚀 Live Demo
+👉 **[Try it live](https://ai-fraud-detection-rmanojgowda.streamlit.app)**
 
 > Production-grade fraud detection platform combining Machine Learning, Graph Analysis, Redis Rate Limiting, and real-time observability.
 
