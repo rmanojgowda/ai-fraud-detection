@@ -1,0 +1,12 @@
+{
+  "optimal_threshold": 0.02,
+  "optimal_recall": 0.8,
+  "optimal_precision": 0.6666666666666666,
+  "optimal_total_cost_inr": 191985.2835365854,
+  "default_threshold": 0.5,
+  "default_total_cost_inr": 203382.34024390246,
+  "savings_vs_default_inr": 11397.056707317068,
+  "cost_per_missed_fraud_inr": 10999.018902439026,
+  "cost_per_false_alarm_inr": 900,
+  "roc_auc": 0.9882614071170331
+}
