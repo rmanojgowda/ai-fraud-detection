@@ -1,196 +1,454 @@
-import networkx as nx
-import pandas as pd
-import numpy as np
-import json
+"""
+Phase 8 — Graph Hardening
+==========================
+Fixes two vulnerabilities in the original graph detector:
+
+Gap 1: Time-based bypass
+  Original: Edges never expire → stale fraud rings persist forever
+  Fix: Edges expire after configurable time window (default 1 hour)
+       Fraudsters who space out attacks bypass detection
+       Time-decay removes stale connections automatically
+
+Gap 2: IP rotation bypass  
+  Original: Only detects cards sharing EXACT same IP
+  Fix: Track merchant-based rings too
+       If card_A and card_B both hit merchant_X within 1 hour
+       → suspicious even if IPs differ
+       Fraudsters rotating IPs still get caught via merchant overlap
+"""
+
+import time
+import threading
 from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, Set, List, Optional
+
+# ── Configuration ─────────────────────────────────────────────
+EDGE_TTL_SECONDS   = 3600   # edges expire after 1 hour
+RING_MIN_CARDS     = 2      # minimum cards to form a ring
+RING_ALERT_CARDS   = 4      # cards that trigger high-risk alert
+CLEANUP_INTERVAL   = 300    # clean expired edges every 5 minutes
+
+
+@dataclass
+class EdgeRecord:
+    """Represents a connection between two entities with timestamp."""
+    source:    str
+    target:    str
+    timestamp: float = field(default_factory=time.time)
+    tx_count:  int   = 1
+
+    def is_expired(self, ttl: float = EDGE_TTL_SECONDS) -> bool:
+        return (time.time() - self.timestamp) > ttl
+
+    def refresh(self):
+        """Update timestamp on new transaction."""
+        self.timestamp = time.time()
+        self.tx_count += 1
+
 
 class FraudGraphDetector:
-    def __init__(self):
-        self.graph        = nx.Graph()
-        self.transactions = []
+    """
+    Real-time fraud ring detector using a time-aware graph.
+    
+    Architecture:
+      - Each transaction adds card→merchant, card→IP, merchant→IP edges
+      - Edges have TTL — stale connections auto-expire
+      - Ring detection checks both IP-based AND merchant-based patterns
+      - Thread-safe for concurrent FastAPI requests
+    
+    Fixes vs Phase 5:
+      ✅ Time-based edge expiry (Gap 1 fix)
+      ✅ Merchant-based ring detection (Gap 2 fix)
+      ✅ Thread-safe with RLock
+      ✅ Background cleanup thread
+      ✅ Ring confidence scoring
+    """
 
-    def add_transaction(self, tx: dict):
-        card_id     = f"card_{tx.get('card_id', 'unknown')}"
-        merchant_id = f"merchant_{tx.get('merchant_id', 'unknown')}"
-        ip_addr     = f"ip_{tx.get('ip', 'unknown')}"
-        amount      = tx.get('amount', 0)
-        is_fraud    = tx.get('is_fraud', 0)
+    def __init__(
+        self,
+        edge_ttl:          int = EDGE_TTL_SECONDS,
+        ring_min_cards:    int = RING_MIN_CARDS,
+        ring_alert_cards:  int = RING_ALERT_CARDS,
+    ):
+        self.edge_ttl         = edge_ttl
+        self.ring_min_cards   = ring_min_cards
+        self.ring_alert_cards = ring_alert_cards
 
-        for node in [card_id, merchant_id, ip_addr]:
-            if node not in self.graph:
-                self.graph.add_node(node,
-                    node_type=node.split("_")[0],
-                    fraud_count=0,
-                    tx_count=0
+        # Graph storage: node → {neighbor: EdgeRecord}
+        self._edges: Dict[str, Dict[str, EdgeRecord]] = defaultdict(dict)
+
+        # Node metadata
+        self._node_tx_count:    Dict[str, int] = defaultdict(int)
+        self._node_fraud_count: Dict[str, int] = defaultdict(int)
+
+        # Thread safety
+        self._lock = threading.RLock()
+
+        # Background cleanup
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_loop,
+            daemon=True
+        )
+        self._cleanup_thread.start()
+
+        # Stats
+        self.total_transactions = 0
+        self.total_rings_detected = 0
+
+    # ── Core: Add Transaction ─────────────────────────────────
+    def add_transaction(
+        self,
+        card_id:     str,
+        merchant_id: str,
+        ip_address:  str,
+        is_fraud:    bool = False
+    ) -> None:
+        """
+        Adds transaction to graph.
+        Creates or refreshes edges between card, merchant, and IP.
+        """
+        card_node     = f"card:{card_id}"
+        merchant_node = f"merchant:{merchant_id}"
+        ip_node       = f"ip:{ip_address}"
+
+        with self._lock:
+            self.total_transactions += 1
+
+            # Add all three edges
+            self._add_edge(card_node,     merchant_node)
+            self._add_edge(card_node,     ip_node)
+            self._add_edge(merchant_node, ip_node)
+
+            # Update node metadata
+            for node in [card_node, merchant_node, ip_node]:
+                self._node_tx_count[node] += 1
+                if is_fraud:
+                    self._node_fraud_count[node] += 1
+
+    def _add_edge(self, source: str, target: str) -> None:
+        """Add or refresh an edge between two nodes."""
+        if target in self._edges[source]:
+            self._edges[source][target].refresh()
+        else:
+            self._edges[source][target] = EdgeRecord(source, target)
+
+        # Keep bidirectional
+        if source in self._edges[target]:
+            self._edges[target][source].refresh()
+        else:
+            self._edges[target][source] = EdgeRecord(target, source)
+
+    # ── Core: Score Transaction ───────────────────────────────
+    def score_transaction(
+        self,
+        card_id:     str,
+        merchant_id: str,
+        ip_address:  str
+    ) -> tuple:
+        """
+        Returns (risk_score, signals) for a transaction.
+        
+        Checks both IP-based rings (original) and
+        merchant-based rings (new — catches IP rotators).
+        """
+        card_node     = f"card:{card_id}"
+        merchant_node = f"merchant:{merchant_id}"
+        ip_node       = f"ip:{ip_address}"
+
+        risk    = 0.0
+        signals = []
+
+        with self._lock:
+            # ── Signal 1: IP-based ring (original) ────────────
+            # Cards sharing same IP in last hour
+            cards_on_ip = self._get_active_neighbors(
+                ip_node, prefix="card:"
+            )
+            if len(cards_on_ip) >= self.ring_min_cards:
+                risk += 0.4
+                signals.append(
+                    f"IP shared by {len(cards_on_ip)} cards "
+                    f"in last {self.edge_ttl//3600}h"
+                )
+            if len(cards_on_ip) >= self.ring_alert_cards:
+                risk += 0.3
+                signals.append(
+                    f"🚨 FRAUD RING (IP): {len(cards_on_ip)} cards "
+                    f"sharing same IP"
+                )
+                self.total_rings_detected += 1
+
+            # ── Signal 2: Merchant-based ring (NEW — Gap 2 fix)
+            # Cards sharing same merchant even with different IPs
+            cards_on_merchant = self._get_active_neighbors(
+                merchant_node, prefix="card:"
+            )
+            if len(cards_on_merchant) >= self.ring_min_cards:
+                # Check if these cards come from different IPs
+                # (IP rotation pattern)
+                ips_for_merchant = self._get_active_neighbors(
+                    merchant_node, prefix="ip:"
+                )
+                if len(ips_for_merchant) > 1:
+                    risk += 0.3
+                    signals.append(
+                        f"Merchant hit by {len(cards_on_merchant)} cards "
+                        f"from {len(ips_for_merchant)} different IPs "
+                        f"(IP rotation pattern)"
+                    )
+                else:
+                    risk += 0.2
+                    signals.append(
+                        f"Merchant hit by {len(cards_on_merchant)} cards "
+                        f"in last {self.edge_ttl//3600}h"
+                    )
+
+            if len(cards_on_merchant) >= self.ring_alert_cards:
+                risk += 0.2
+                signals.append(
+                    f"🚨 FRAUD RING (Merchant): {len(cards_on_merchant)} "
+                    f"cards at same merchant"
                 )
 
-        self.graph.add_edge(card_id,     merchant_id, amount=amount, is_fraud=is_fraud)
-        self.graph.add_edge(merchant_id, ip_addr,     amount=amount, is_fraud=is_fraud)
-        self.graph.add_edge(card_id,     ip_addr,     amount=amount, is_fraud=is_fraud)
-
-        for node in [card_id, merchant_id, ip_addr]:
-            self.graph.nodes[node]['tx_count']    += 1
-            self.graph.nodes[node]['fraud_count'] += is_fraud
-
-        self.transactions.append(tx)
-
-    def get_graph_risk_score(self, card_id: str, merchant_id: str, ip: str) -> dict:
-        card_node     = f"card_{card_id}"
-        merchant_node = f"merchant_{merchant_id}"
-        ip_node       = f"ip_{ip}"
-
-        risk_signals = []
-        risk_score   = 0.0
-
-        # Signal 1: Known fraud card
-        if self.graph.has_node(card_node):
-            data        = self.graph.nodes[card_node]
-            tx_count    = data.get('tx_count', 0)
-            fraud_count = data.get('fraud_count', 0)
+            # ── Signal 3: Known fraud card ────────────────────
+            tx_count    = self._node_tx_count.get(card_node, 0)
+            fraud_count = self._node_fraud_count.get(card_node, 0)
             if tx_count > 0 and fraud_count / tx_count > 0.3:
-                risk_score += 0.4
-                risk_signals.append(
-                    f"Card has {fraud_count/tx_count*100:.0f}% historical fraud rate"
+                risk += 0.4
+                fraud_rate = fraud_count / tx_count * 100
+                signals.append(
+                    f"Card has {fraud_rate:.0f}% historical fraud rate"
                 )
 
-        # Signal 2: Suspicious merchant
-        if self.graph.has_node(merchant_node):
-            data        = self.graph.nodes[merchant_node]
-            tx_count    = data.get('tx_count', 0)
-            fraud_count = data.get('fraud_count', 0)
-            if tx_count > 2 and fraud_count / max(tx_count, 1) > 0.2:
-                risk_score += 0.3
-                risk_signals.append(
-                    f"Merchant linked to {fraud_count} fraud cases"
+            # ── Signal 4: High velocity on merchant ───────────
+            recent_merchant_tx = self._edges[merchant_node]
+            active_tx = sum(
+                1 for edge in recent_merchant_tx.values()
+                if not edge.is_expired(self.edge_ttl)
+            )
+            if active_tx > 10:
+                risk += 0.1
+                signals.append(
+                    f"Merchant has {active_tx} active connections "
+                    f"(high velocity)"
                 )
 
-        # Signal 3: Shared IP (lowered threshold to 2 cards)
-        if self.graph.has_node(ip_node):
-            ip_neighbors   = list(self.graph.neighbors(ip_node))
-            card_neighbors = [n for n in ip_neighbors if n.startswith("card_")]
-            if len(card_neighbors) >= 2:
-                risk_score += 0.4
-                risk_signals.append(
-                    f"IP shared by {len(card_neighbors)} different cards — possible fraud ring"
-                )
+        if not signals:
+            signals.append("No suspicious graph patterns detected")
 
-        # Signal 4: Connected to fraud entities
-        if self.graph.has_node(card_node):
-            component   = nx.node_connected_component(self.graph, card_node)
-            fraud_nodes = [
-                n for n in component
-                if self.graph.nodes[n].get('fraud_count', 0) > 0
-            ]
-            if len(fraud_nodes) >= 1:
-                risk_score += 0.2
-                risk_signals.append(
-                    f"Card connected to {len(fraud_nodes)} fraud-flagged entities in graph"
-                )
+        return min(round(risk, 4), 1.0), signals
 
-        # Signal 5: IP shared by many cards (ring pattern)
-        if self.graph.has_node(ip_node):
-            ip_neighbors   = list(self.graph.neighbors(ip_node))
-            card_neighbors = [n for n in ip_neighbors if n.startswith("card_")]
-            if len(card_neighbors) >= 4:
-                risk_score += 0.3
-                risk_signals.append(
-                    f"FRAUD RING: {len(card_neighbors)} cards sharing same IP and merchant"
-                )
-
-        if not risk_signals:
-            risk_signals.append("No suspicious graph patterns detected")
-
-        return {
-            "graph_risk_score": min(round(risk_score, 4), 1.0),
-            "graph_signals":    risk_signals,
-            "nodes_in_graph":   self.graph.number_of_nodes(),
-            "edges_in_graph":   self.graph.number_of_edges(),
-        }
-
-    def detect_fraud_rings(self) -> list:
+    # ── Ring Detection ────────────────────────────────────────
+    def detect_rings(self) -> List[dict]:
+        """
+        Detects all active fraud rings.
+        Returns both IP-based and merchant-based rings.
+        """
         rings = []
-        for component in nx.connected_components(self.graph):
-            nodes     = list(component)
-            cards     = [n for n in nodes if n.startswith("card_")]
-            merchants = [n for n in nodes if n.startswith("merchant_")]
-            ips       = [n for n in nodes if n.startswith("ip_")]
 
-            # Lowered threshold: 2+ cards sharing infrastructure
-            if len(cards) >= 2 and (len(merchants) >= 1 or len(ips) >= 1):
-                total_fraud = sum(
-                    self.graph.nodes[n].get('fraud_count', 0)
-                    for n in nodes
-                )
-                # Check IP sharing (key fraud ring signal)
-                shared_ip = len(ips) > 0 and len(cards) >= 2
-                risk = "HIGH" if total_fraud > 0 else ("HIGH" if shared_ip and len(cards) >= 4 else "MEDIUM")
+        with self._lock:
+            # IP-based rings
+            ip_nodes = [
+                n for n in self._edges
+                if n.startswith("ip:")
+            ]
+            for ip_node in ip_nodes:
+                cards = self._get_active_neighbors(ip_node, "card:")
+                if len(cards) >= self.ring_min_cards:
+                    merchants = self._get_active_neighbors(
+                        ip_node, "merchant:"
+                    )
+                    fraud_count = sum(
+                        self._node_fraud_count.get(c, 0) for c in cards
+                    )
+                    rings.append({
+                        "type":         "IP_BASED",
+                        "cards":        cards,
+                        "merchants":    merchants,
+                        "pivot":        ip_node,
+                        "total_fraud":  fraud_count,
+                        "ring_pattern": (
+                            f"{len(cards)} cards → "
+                            f"{len(merchants)} merchants → "
+                            f"1 IP"
+                        ),
+                        "risk": "HIGH" if len(cards) >= self.ring_alert_cards
+                                else "MEDIUM"
+                    })
 
-                rings.append({
-                    "cards":        cards,
-                    "merchants":    merchants,
-                    "ips":          ips,
-                    "total_fraud":  total_fraud,
-                    "ring_size":    len(nodes),
-                    "shared_ip":    shared_ip,
-                    "risk":         risk,
-                    "ring_pattern": f"{len(cards)} cards → {len(merchants)} merchants → {len(ips)} IPs"
-                })
+            # Merchant-based rings (NEW)
+            merchant_nodes = [
+                n for n in self._edges
+                if n.startswith("merchant:")
+            ]
+            for merchant_node in merchant_nodes:
+                cards = self._get_active_neighbors(merchant_node, "card:")
+                if len(cards) >= self.ring_min_cards:
+                    ips = self._get_active_neighbors(merchant_node, "ip:")
+                    # Only flag as merchant ring if multiple IPs
+                    # (otherwise already caught by IP ring)
+                    if len(ips) > 1:
+                        fraud_count = sum(
+                            self._node_fraud_count.get(c, 0)
+                            for c in cards
+                        )
+                        rings.append({
+                            "type":         "MERCHANT_BASED",
+                            "cards":        cards,
+                            "merchants":    [merchant_node],
+                            "pivot":        merchant_node,
+                            "total_fraud":  fraud_count,
+                            "ring_pattern": (
+                                f"{len(cards)} cards → "
+                                f"1 merchant ← "
+                                f"{len(ips)} IPs"
+                            ),
+                            "risk": "HIGH" if len(cards) >= self.ring_alert_cards
+                                    else "MEDIUM"
+                        })
 
-        return sorted(rings, key=lambda x: len(x['cards']), reverse=True)
+        return sorted(rings, key=lambda x: len(x["cards"]), reverse=True)
 
+    # ── Helper: Active Neighbors ──────────────────────────────
+    def _get_active_neighbors(
+        self,
+        node:   str,
+        prefix: str = ""
+    ) -> List[str]:
+        """
+        Returns non-expired neighbors of a node,
+        optionally filtered by prefix.
+        """
+        if node not in self._edges:
+            return []
+
+        active = []
+        for neighbor, edge in self._edges[node].items():
+            if not edge.is_expired(self.edge_ttl):
+                if not prefix or neighbor.startswith(prefix):
+                    active.append(neighbor)
+        return active
+
+    # ── Background Cleanup ────────────────────────────────────
+    def _cleanup_loop(self) -> None:
+        """
+        Background thread that removes expired edges.
+        Runs every CLEANUP_INTERVAL seconds.
+        Prevents memory leak from accumulating stale edges.
+        """
+        while True:
+            time.sleep(CLEANUP_INTERVAL)
+            self._cleanup_expired()
+
+    def _cleanup_expired(self) -> None:
+        """Remove all expired edges from the graph."""
+        with self._lock:
+            nodes_to_clean = list(self._edges.keys())
+            total_removed  = 0
+
+            for node in nodes_to_clean:
+                expired = [
+                    neighbor
+                    for neighbor, edge in self._edges[node].items()
+                    if edge.is_expired(self.edge_ttl)
+                ]
+                for neighbor in expired:
+                    del self._edges[node][neighbor]
+                    total_removed += 1
+
+                # Remove empty node entries
+                if not self._edges[node]:
+                    del self._edges[node]
+
+    # ── Stats ─────────────────────────────────────────────────
     def get_stats(self) -> dict:
-        rings = self.detect_fraud_rings()
-        high_risk = [r for r in rings if r['risk'] == 'HIGH']
-        return {
-            "total_nodes":       self.graph.number_of_nodes(),
-            "total_edges":       self.graph.number_of_edges(),
-            "total_components":  nx.number_connected_components(self.graph),
-            "fraud_rings":       len(rings),
-            "high_risk_rings":   len(high_risk),
-        }
+        """Returns graph statistics for /metrics endpoint."""
+        with self._lock:
+            active_nodes = 0
+            active_edges = 0
+            for node, neighbors in self._edges.items():
+                active = sum(
+                    1 for e in neighbors.values()
+                    if not e.is_expired(self.edge_ttl)
+                )
+                if active > 0:
+                    active_nodes += 1
+                    active_edges += active
+
+            return {
+                "active_nodes":       active_nodes,
+                "active_edges":       active_edges // 2,  # bidirectional
+                "total_transactions": self.total_transactions,
+                "total_rings":        self.total_rings_detected,
+                "edge_ttl_seconds":   self.edge_ttl,
+            }
+
+    def reset(self) -> None:
+        """Clear all graph data (useful for testing)."""
+        with self._lock:
+            self._edges.clear()
+            self._node_tx_count.clear()
+            self._node_fraud_count.clear()
+            self.total_transactions   = 0
+            self.total_rings_detected = 0
 
 
-# ── Demo ──────────────────────────────────────────
+# ── Quick Test ────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("=" * 55)
-    print("   GRAPH-BASED FRAUD DETECTION — DEMO")
-    print("=" * 55)
+    print("=" * 60)
+    print("  PHASE 8 — GRAPH HARDENING TEST")
+    print("=" * 60)
 
-    detector = FraudGraphDetector()
+    detector = FraudGraphDetector(edge_ttl=3600)
 
-    print("\n[1/4] Adding normal transactions...")
-    for tx in [
-        {"card_id": "1001", "merchant_id": "M01", "ip": "10.0.0.1",  "amount": 50,  "is_fraud": 0},
-        {"card_id": "1002", "merchant_id": "M02", "ip": "10.0.0.2",  "amount": 120, "is_fraud": 0},
-    ]:
-        detector.add_transaction(tx)
+    print("\n[1] IP-based ring test (original behavior):")
+    for i in range(1, 6):
+        card = f"card_{i:03d}"
+        detector.add_transaction(card, "merchant_A", "10.0.0.1")
+        risk, signals = detector.score_transaction(
+            card, "merchant_A", "10.0.0.1"
+        )
+        print(f"    {card} → risk: {risk:.2f} | {signals[0]}")
 
-    print("[2/4] Adding fraud ring (5 cards, same merchant+IP)...")
-    for i, card in enumerate(["9001","9002","9003","9004","9005"]):
-        detector.add_transaction({
-            "card_id": card, "merchant_id": "M99",
-            "ip": "192.168.1.1", "amount": 1, "is_fraud": 1
-        })
+    print("\n[2] IP rotation bypass test (NEW — Gap 2 fix):")
+    detector2 = FraudGraphDetector(edge_ttl=3600)
+    ips = ["192.168.1.1", "192.168.2.1", "192.168.3.1",
+           "192.168.4.1", "192.168.5.1"]
+    for i, ip in enumerate(ips, 1):
+        card = f"card_{i:03d}"
+        # Each card uses a DIFFERENT IP but same merchant
+        detector2.add_transaction(card, "merchant_X", ip)
+        risk, signals = detector2.score_transaction(
+            card, "merchant_X", ip
+        )
+        print(f"    {card} (IP: {ip}) → risk: {risk:.2f} | {signals[0]}")
 
-    print("\n[3/4] Graph Statistics:")
+    print("\n[3] Ring detection:")
+    rings = detector.detect_rings()
+    print(f"    Rings found: {len(rings)}")
+    for ring in rings:
+        print(f"    Type: {ring['type']} | {ring['ring_pattern']} | {ring['risk']}")
+
+    print("\n[4] Stats:")
     stats = detector.get_stats()
     for k, v in stats.items():
-        print(f"      {k}: {v}")
+        print(f"    {k}: {v}")
 
-    print("\n[4/4] Scoring new transaction from ring IP...")
-    result = detector.get_graph_risk_score("9001", "M99", "192.168.1.1")
-    print(f"\n      Graph Risk Score : {result['graph_risk_score']}")
-    print(f"      Signals:")
-    for s in result['graph_signals']:
-        print(f"        • {s}")
+    print("\n[5] Time expiry test:")
+    detector3 = FraudGraphDetector(edge_ttl=1)  # 1 second TTL
+    detector3.add_transaction("card_old", "merchant_B", "10.0.0.2")
+    risk_before, _ = detector3.score_transaction(
+        "card_new", "merchant_B", "10.0.0.3"
+    )
+    time.sleep(2)  # wait for expiry
+    risk_after, _ = detector3.score_transaction(
+        "card_new", "merchant_B", "10.0.0.3"
+    )
+    print(f"    Risk before expiry : {risk_before:.2f}")
+    print(f"    Risk after expiry  : {risk_after:.2f}")
+    print(f"    Time-decay working : {'✅ YES' if risk_after < risk_before else '❌ NO'}")
 
-    print("\n      Fraud Rings:")
-    for i, ring in enumerate(detector.detect_fraud_rings(), 1):
-        print(f"\n      Ring {i}: {ring['ring_pattern']}")
-        print(f"        Risk    : {ring['risk']}")
-        print(f"        Cards   : {ring['cards']}")
-        print(f"        IPs     : {ring['ips']}")
-
-    print("\n" + "=" * 55)
-    print("GRAPH DETECTION COMPLETE ✅")
-    print("=" * 55)
+    print("\n" + "=" * 60)
+    print("  GRAPH HARDENING COMPLETE ✅")
+    print("=" * 60)
