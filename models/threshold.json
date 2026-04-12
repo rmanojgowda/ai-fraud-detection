@@ -1,1 +1,7 @@
-{"threshold": 0.3}
+{
+  "threshold": 0.7722156368302467,
+  "precision": 0.9344262295081968,
+  "recall": 0.76,
+  "roc_auc": 0.9882614071170331,
+  "model_type": "LightGBM"
+}
