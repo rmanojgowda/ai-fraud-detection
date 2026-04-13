@@ -1,10 +1,13 @@
-venv/
+﻿venv/
 __pycache__/
 *.pyc
 *.pyo
 data/creditcard.csv
 logs/
-models/fraud_model.pkl
-Thumbs.db
+dump.rdb
 .vscode/
 *.tmp
+models/threshold_results.csv
+test_*.py
+gitignore
+models/threshold_analysis.json
