@@ -371,7 +371,7 @@ with tab3:
     st.markdown("**Model Performance**")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("ROC-AUC",       "0.9883")
-    m2.metric("Fraud Recall    : 76% (93% precision)
+    m2.metric("Fraud Recall",  "76% (93% precision)")
     m3.metric("Frauds Caught", "57/75")
     m4.metric("Threshold",     "0.7722")
 
