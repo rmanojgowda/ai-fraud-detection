@@ -3,5 +3,6 @@
   "precision": 0.9344262295081968,
   "recall": 0.76,
   "roc_auc": 0.9882614071170331,
-  "model_type": "LightGBM"
+  "model_type": "LightGBM",
+  "note": "18 missed frauds score below threshold \u2014 genuine ambiguous cases"
 }

@@ -1,9 +1,0 @@
-Set-Content -Path "D:\fraud-detection\.gitignore" -Value "venv/
-__pycache__/
-*.pyc
-*.pyo
-data/creditcard.csv
-logs/
-Thumbs.db
-.vscode/
-*.tmp"
