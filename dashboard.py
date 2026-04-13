@@ -146,8 +146,8 @@ st.markdown("Real-time fraud scoring with **ML + Graph Detection + Rate Limiting
 # Status bar
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Status",         "🟢 Online")
-c2.metric("Model",          "Gradient Boosting")
-c3.metric("ROC-AUC",        "0.9850")
+c2.metric("Model",          "LightGBM")
+c3.metric("ROC-AUC",        "0.9883")
 c4.metric("Total Requests", st.session_state.total_requests)
 c5.metric("Fraud Detected", st.session_state.fraud_detected)
 st.divider()
@@ -370,18 +370,18 @@ with tab3:
     st.divider()
     st.markdown("**Model Performance**")
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("ROC-AUC",       "0.9850")
-    m2.metric("Fraud Recall",  "85.33%")
-    m3.metric("Frauds Caught", "64/75")
-    m4.metric("Threshold",     "0.30")
+    m1.metric("ROC-AUC",       "0.9883")
+    m2.metric("Fraud Recall    : 76% (93% precision)
+    m3.metric("Frauds Caught", "57/75")
+    m4.metric("Threshold",     "0.7722")
 
 # Footer
 st.divider()
 st.markdown("""
 <div style='text-align:center; color:gray; font-size:12px'>
 🛡️ AI Credit Card Fraud Detection System &nbsp;|&nbsp;
-FastAPI + Streamlit + Gradient Boosting + Graph ML &nbsp;|&nbsp;
-Redis Rate Limiting &nbsp;|&nbsp; ROC-AUC: 0.9850 &nbsp;|&nbsp;
+FastAPI + Streamlit + LightGBM + Graph ML &nbsp;|&nbsp;
+Redis Rate Limiting &nbsp;|&nbsp; ROC-AUC: 0.9883 &nbsp;|&nbsp;
 <a href='https://github.com/rmanojgowda/ai-fraud-detection'>GitHub</a>
 </div>
 """, unsafe_allow_html=True)
