@@ -127,9 +127,23 @@ results_df = pd.DataFrame(results)
 # ── Find Optimal Thresholds ───────────────────────────────────
 print("\n[4/5] Finding optimal thresholds...")
 
-# 1. Minimum cost threshold
-min_cost_idx   = results_df["total_cost"].idxmin()
-min_cost_row   = results_df.iloc[min_cost_idx]
+# Precision floor: no bank deploys a model with precision < 90%
+# (would block 1 in 10 legitimate customers)
+PRECISION_FLOOR = 0.90
+print(f"      Precision floor constraint: >= {PRECISION_FLOOR:.0%}")
+print(f"      (Unconstrained minimum rejected if precision too low)")
+
+# Show what unconstrained minimum would be
+unconstrained_idx = results_df["total_cost"].idxmin()
+unconstrained_row = results_df.iloc[unconstrained_idx]
+if unconstrained_row["precision"] < PRECISION_FLOOR:
+    print(f"      Unconstrained minimum: {unconstrained_row['threshold']:.2f} "
+          f"(precision {unconstrained_row['precision']:.1%}) — REJECTED by floor")
+
+# 1. Minimum cost threshold WITH precision constraint
+valid_rows   = results_df[results_df["precision"] >= PRECISION_FLOOR]
+min_cost_idx = valid_rows["total_cost"].idxmin()
+min_cost_row = results_df.iloc[min_cost_idx]
 
 # 2. Default threshold (0.5) for comparison
 default_row = results_df[results_df["threshold"] == 0.50].iloc[0]
