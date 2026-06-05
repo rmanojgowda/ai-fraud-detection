@@ -7,6 +7,7 @@ from transaction_replay import save_for_replay, get_replay_system
 from geo_risk import score_geo_risk, get_geo_scorer, score_geo_risk_from_vfeatures
 from webhook_alerts import get_alert_system, send_fraud_ring_alert, send_high_risk_alert, send_rate_limit_alert
 from pydantic import BaseModel
+from velocity_decay import get_velocity_calculator, record_velocity, get_velocity_risk
 import numpy as np
 import time
 import json
@@ -280,6 +281,10 @@ def alert_stats():
 def alert_history():
     return {"alerts": get_alert_system().get_history(limit=20)}
 
+@app.get("/velocity/stats")
+def velocity_stats():
+    return get_velocity_calculator().get_stats()
+
 @app.post("/fraud/check", response_model=FraudResponse)
 def check_fraud(tx: TransactionRequest, request: Request):
     request_id = str(uuid.uuid4())[:8]
@@ -348,17 +353,7 @@ def check_fraud(tx: TransactionRequest, request: Request):
     if rings:
         record_ring_detected()
     
-    # ── Webhook alerts ────────────────────────────────────────
-    if decision == "BLOCK" and combined_score > 0.85:
-        send_high_risk_alert(
-            request_id = request_id,
-            risk_score = combined_score,
-            ml_score   = ml_score,
-            geo_score  = geo_score,
-            amount     = tx.Amount,
-            country    = tx.country,
-            card_id    = tx.card_id
-        )
+    
 
     # ── Geographic risk score ─────────────────────────────────
     geo_score_country, geo_signals_country = score_geo_risk(
@@ -377,8 +372,18 @@ def check_fraud(tx: TransactionRequest, request: Request):
         geo_score   = geo_score_country
         geo_signals = geo_signals_country
 
+    # ── Velocity decay score ──────────────────────────────────
+    record_velocity(tx.card_id)
+    velocity_risk, velocity_signals = get_velocity_risk(tx.card_id)
+
     # ── Combined decision ─────────────────────────────────────
-    combined_score = round(0.5 * ml_score + 0.3 * graph_score + 0.2 * geo_score, 4)
+    combined_score = round(
+        0.4 * ml_score +
+        0.25 * graph_score +
+        0.20 * geo_score +
+        0.15 * velocity_risk,
+        4
+    )
     decision       = decide(combined_score)
     reasons        = explain(features, combined_score)
     shap_result    = shap_explain(features, top_n=5)
@@ -396,6 +401,26 @@ def check_fraud(tx: TransactionRequest, request: Request):
 
     if graph_score > 0.3:
         stats["graph_flagged"] += 1
+
+    # ── Webhook alerts ────────────────────────────────────────
+    if rings:
+        for ring in rings:
+            send_fraud_ring_alert(
+                ring_type    = ring.get("type", "UNKNOWN"),
+                card_count   = ring.get("size", 0),
+                merchant_ids = ring.get("merchants", []),
+                ip_addresses = ring.get("ips", [])
+            )
+    if decision == "BLOCK" and combined_score > 0.85:
+        send_high_risk_alert(
+            request_id = request_id,
+            risk_score = combined_score,
+            ml_score   = ml_score,
+            geo_score  = geo_score,
+            amount     = tx.Amount,
+            country    = tx.country,
+            card_id    = tx.card_id
+        )
 
     # ── Record Prometheus metrics ─────────────────────────────
     record_request(

@@ -1,0 +1,17 @@
+{
+	"ulid": "01KTBT7VP2FXR24106EBSV3HHS",
+	"minTime": 1780649763624,
+	"maxTime": 1780653600000,
+	"stats": {
+		"numSamples": 495,
+		"numSeries": 5,
+		"numChunks": 10
+	},
+	"compaction": {
+		"level": 1,
+		"sources": [
+			"01KTBT7VP2FXR24106EBSV3HHS"
+		]
+	},
+	"version": 1
+}
