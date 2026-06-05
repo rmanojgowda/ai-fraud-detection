@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from explainability import explain_transaction as shap_explain, format_explanation
 from ab_testing import start_experiment, stop_experiment, get_experiment
 from fraud_heatmap import record_heatmap, get_heatmap, get_dynamic_threshold
+from transaction_replay import save_for_replay, get_replay_system
 from pydantic import BaseModel
 import numpy as np
 import time
@@ -244,6 +245,23 @@ def ab_test_stop():
 def fraud_heatmap():
     return get_heatmap().get_heatmap_data()
 
+@app.get("/replay/stats")
+def replay_stats():
+    return get_replay_system().get_stats()
+
+@app.post("/replay/run")
+def replay_run(limit: int = 100):
+    import json
+    with open("models/feature_cols.json") as f:
+        cols = json.load(f)
+    results = get_replay_system().replay_against_model(
+        model_path="models/fraud_model.pkl",
+        feature_cols=cols,
+        threshold=0.7722,
+        limit=limit
+    )
+    return results
+
 @app.post("/fraud/check", response_model=FraudResponse)
 def check_fraud(tx: TransactionRequest, request: Request):
     request_id = str(uuid.uuid4())[:8]
@@ -346,8 +364,20 @@ def check_fraud(tx: TransactionRequest, request: Request):
         group = exp.assign_group(tx.card_id)
         exp.record_result(tx.card_id, group, decision, latency, combined_score)
         
-     # ── Heatmap recording ─────────────────────────────────────
+    # ── Heatmap recording ─────────────────────────────────────
     record_heatmap(tx.hour, decision, combined_score)
+
+    # ── Save for replay ───────────────────────────────────────
+    save_for_replay(
+        request_id  = request_id,
+        features    = features,
+        card_id     = tx.card_id,
+        decision    = decision,
+        score       = combined_score,
+        graph_score = graph_score,
+        amount      = tx.Amount,
+        hour        = tx.hour,
+    )
     # ── Log ───────────────────────────────────────────────────
     log_event("transaction_scored", {
         "request_id":  request_id,
