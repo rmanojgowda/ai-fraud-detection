@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from explainability import explain_transaction as shap_explain, format_explanation
 from ab_testing import start_experiment, stop_experiment, get_experiment
+from fraud_heatmap import record_heatmap, get_heatmap, get_dynamic_threshold
 from pydantic import BaseModel
 import numpy as np
 import time
@@ -239,6 +240,10 @@ def ab_test_stop():
     return results
 
 
+@app.get("/heatmap")
+def fraud_heatmap():
+    return get_heatmap().get_heatmap_data()
+
 @app.post("/fraud/check", response_model=FraudResponse)
 def check_fraud(tx: TransactionRequest, request: Request):
     request_id = str(uuid.uuid4())[:8]
@@ -340,6 +345,9 @@ def check_fraud(tx: TransactionRequest, request: Request):
     if exp and exp.active:
         group = exp.assign_group(tx.card_id)
         exp.record_result(tx.card_id, group, decision, latency, combined_score)
+        
+     # ── Heatmap recording ─────────────────────────────────────
+    record_heatmap(tx.hour, decision, combined_score)
     # ── Log ───────────────────────────────────────────────────
     log_event("transaction_scored", {
         "request_id":  request_id,
@@ -352,6 +360,7 @@ def check_fraud(tx: TransactionRequest, request: Request):
         "decision":    decision,
         "latency_ms":  latency
     })
+
 
     return FraudResponse(
         request_id=request_id,
