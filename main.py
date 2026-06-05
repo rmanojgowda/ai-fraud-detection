@@ -4,8 +4,8 @@ from explainability import explain_transaction as shap_explain, format_explanati
 from ab_testing import start_experiment, stop_experiment, get_experiment
 from fraud_heatmap import record_heatmap, get_heatmap, get_dynamic_threshold
 from transaction_replay import save_for_replay, get_replay_system
-from geo_risk import score_geo_risk, get_geo_scorer
-from geo_risk import score_geo_risk, get_geo_scorer\
+from geo_risk import score_geo_risk, get_geo_scorer, score_geo_risk_from_vfeatures
+from webhook_alerts import get_alert_system, send_fraud_ring_alert, send_high_risk_alert, send_rate_limit_alert
 from pydantic import BaseModel
 import numpy as np
 import time
@@ -272,6 +272,14 @@ def replay_run(limit: int = 100):
     )
     return results
 
+@app.get("/alerts/stats")
+def alert_stats():
+    return get_alert_system().get_stats()
+
+@app.get("/alerts/history")
+def alert_history():
+    return {"alerts": get_alert_system().get_history(limit=20)}
+
 @app.post("/fraud/check", response_model=FraudResponse)
 def check_fraud(tx: TransactionRequest, request: Request):
     request_id = str(uuid.uuid4())[:8]
@@ -339,6 +347,18 @@ def check_fraud(tx: TransactionRequest, request: Request):
     rings = graph_detector.detect_rings()
     if rings:
         record_ring_detected()
+    
+    # ── Webhook alerts ────────────────────────────────────────
+    if decision == "BLOCK" and combined_score > 0.85:
+        send_high_risk_alert(
+            request_id = request_id,
+            risk_score = combined_score,
+            ml_score   = ml_score,
+            geo_score  = geo_score,
+            amount     = tx.Amount,
+            country    = tx.country,
+            card_id    = tx.card_id
+        )
 
     # ── Geographic risk score ─────────────────────────────────
     geo_score_country, geo_signals_country = score_geo_risk(
