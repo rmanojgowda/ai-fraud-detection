@@ -178,7 +178,7 @@ def check_fraud(tx: TransactionRequest, request: Request):
     stats["total_requests"] += 1
 
     # ── Phase 9: Dual-window rate limiter ─────────────────────
-    allowed, reason = rate_limiter.is_allowed(client_ip)
+    allowed, reason = rate_limiter.is_allowed(client_ip, tx.card_id)
     if not allowed:
         stats["blocked_rate"] += 1
         log_event("rate_limited", {
