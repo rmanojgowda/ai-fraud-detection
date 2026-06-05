@@ -4,6 +4,7 @@ from explainability import explain_transaction as shap_explain, format_explanati
 from ab_testing import start_experiment, stop_experiment, get_experiment
 from fraud_heatmap import record_heatmap, get_heatmap, get_dynamic_threshold
 from transaction_replay import save_for_replay, get_replay_system
+from geo_risk import score_geo_risk, get_geo_scorer
 from pydantic import BaseModel
 import numpy as np
 import time
@@ -124,6 +125,8 @@ class TransactionRequest(BaseModel):
     card_id: str         = "unknown"
     merchant_id: str     = "unknown"
     ip: str              = "0.0.0.0"
+    country: str         = "IN"
+    city: str            = "unknown"
 
 
 class FraudResponse(BaseModel):
@@ -131,9 +134,11 @@ class FraudResponse(BaseModel):
     risk_score:    float
     ml_score:      float
     graph_score:   float
+    geo_score:     float
     decision:      str
     explanation:   list[str]
     graph_signals: list[str]
+    geo_signals:   list[str]
     rate_limiter:  str
     latency_ms:    float
 
@@ -245,6 +250,10 @@ def ab_test_stop():
 def fraud_heatmap():
     return get_heatmap().get_heatmap_data()
 
+@app.get("/geo/stats")
+def geo_stats():
+    return get_geo_scorer().get_stats()
+
 @app.get("/replay/stats")
 def replay_stats():
     return get_replay_system().get_stats()
@@ -330,8 +339,16 @@ def check_fraud(tx: TransactionRequest, request: Request):
     if rings:
         record_ring_detected()
 
+    # ── Geographic risk score ─────────────────────────────────
+    geo_score, geo_signals = score_geo_risk(
+        card_id      = tx.card_id,
+        country_code = tx.country,
+        city         = tx.city if tx.city != "unknown" else None,
+        ip_address   = tx.ip
+    )
+
     # ── Combined decision ─────────────────────────────────────
-    combined_score = round(0.6 * ml_score + 0.4 * graph_score, 4)
+    combined_score = round(0.5 * ml_score + 0.3 * graph_score + 0.2 * geo_score, 4)
     decision       = decide(combined_score)
     reasons        = explain(features, combined_score)
     shap_result    = shap_explain(features, top_n=5)
@@ -397,9 +414,11 @@ def check_fraud(tx: TransactionRequest, request: Request):
         risk_score=combined_score,
         ml_score=round(ml_score, 4),
         graph_score=round(graph_score, 4),
+        geo_score=round(geo_score, 4),
         decision=decision,
         explanation=shap_reasons,
         graph_signals=graph_signals,
+        geo_signals=geo_signals,
         rate_limiter="redis" if rate_limiter._redis_available else "in-memory",
         latency_ms=latency
     )
