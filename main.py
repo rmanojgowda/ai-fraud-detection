@@ -5,6 +5,7 @@ from ab_testing import start_experiment, stop_experiment, get_experiment
 from fraud_heatmap import record_heatmap, get_heatmap, get_dynamic_threshold
 from transaction_replay import save_for_replay, get_replay_system
 from geo_risk import score_geo_risk, get_geo_scorer
+from geo_risk import score_geo_risk, get_geo_scorer\
 from pydantic import BaseModel
 import numpy as np
 import time
@@ -340,12 +341,21 @@ def check_fraud(tx: TransactionRequest, request: Request):
         record_ring_detected()
 
     # ── Geographic risk score ─────────────────────────────────
-    geo_score, geo_signals = score_geo_risk(
+    geo_score_country, geo_signals_country = score_geo_risk(
         card_id      = tx.card_id,
         country_code = tx.country,
         city         = tx.city if tx.city != "unknown" else None,
         ip_address   = tx.ip
     )
+    geo_score_vfeat, geo_signals_vfeat = score_geo_risk_from_vfeatures(features)
+
+    # Take the higher of the two scores
+    if geo_score_vfeat > geo_score_country:
+        geo_score   = geo_score_vfeat
+        geo_signals = geo_signals_vfeat
+    else:
+        geo_score   = geo_score_country
+        geo_signals = geo_signals_country
 
     # ── Combined decision ─────────────────────────────────────
     combined_score = round(0.5 * ml_score + 0.3 * graph_score + 0.2 * geo_score, 4)
