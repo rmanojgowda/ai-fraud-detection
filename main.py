@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from explainability import explain_transaction as shap_explain, format_explanation
 from pydantic import BaseModel
 import numpy as np
 import time
@@ -12,10 +13,14 @@ from datetime import datetime
 from fraud_inference import score_transaction, decide, explain, get_model_info
 from graph_fraud import FraudGraphDetector
 from rate_limiter import DualWindowRateLimiter
+from metrics import (
+    record_request, record_rate_limit, record_ring_detected,
+    update_system_state, get_metrics_output,
+    CONTENT_TYPE_LATEST
+)
 
-# ── Logging Setup ─────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────
 os.makedirs("logs", exist_ok=True)
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
@@ -27,21 +32,19 @@ logging.basicConfig(
 logger = logging.getLogger("fraud_api")
 
 def log_event(event: str, data: dict):
-    entry = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "event":     event,
-        **data
-    }
+    entry = {"timestamp": datetime.utcnow().isoformat(),
+             "event": event, **data}
     logger.info(json.dumps(entry))
 
-# ── App Setup ─────────────────────────────────────────────────
+# ── App ───────────────────────────────────────────────────────
 app = FastAPI(
     title="AI Credit Card Fraud Detection API",
     description=(
         "Real-time fraud detection with LightGBM ML + "
-        "Graph Ring Detection + Dual-Window Redis Rate Limiting"
+        "Graph Ring Detection + Dual-Window + Card-Level Rate Limiting + "
+        "Prometheus Metrics"
     ),
-    version="5.0.0"
+    version="6.0.0"
 )
 
 app.add_middleware(
@@ -52,20 +55,25 @@ app.add_middleware(
 )
 
 # ── Shared Instances ──────────────────────────────────────────
-# Graph detector (Phase 8 — hardened with TTL + merchant rings)
 graph_detector = FraudGraphDetector(edge_ttl=3600)
-log_event("startup", {"graph_detector": "initialized"})
+rate_limiter   = DualWindowRateLimiter()
+model_info     = get_model_info()
 
-# Rate limiter (Phase 9 — dual window: 5/10s + 100/hr)
-rate_limiter = DualWindowRateLimiter()
+log_event("startup", {"version": "6.0.0",
+                       "model": model_info["model_type"],
+                       "threshold": model_info["threshold"]})
 log_event("startup", {
-    "rate_limiter": "dual_window",
-    "short_window": "5/10s",
-    "long_window":  "100/hr",
-    "redis":        "connected" if rate_limiter._redis_available else "unavailable"
+    "rate_limiter": "triple_layer",
+    "layers": "5/10s + 100/hr + 3/hr/card",
+    "redis": "connected" if rate_limiter._redis_available else "unavailable"
 })
+log_event("startup", {"prometheus": "enabled", "metrics_path": "/metrics"})
 
-# ── Server Stats ──────────────────────────────────────────────
+# ── Update Prometheus model threshold ────────────────────────
+from metrics import MODEL_THRESHOLD
+MODEL_THRESHOLD.set(model_info["threshold"])
+
+# ── Stats ─────────────────────────────────────────────────────
 START_TIME = time.time()
 stats = {
     "total_requests": 0,
@@ -77,9 +85,24 @@ stats = {
     "graph_flagged":  0,
 }
 
+# ── Request rate tracking ─────────────────────────────────────
+_request_times = []
+_request_lock  = __import__('threading').Lock()
+
+def _track_request_rate():
+    now = time.time()
+    with _request_lock:
+        _request_times.append(now)
+        # Keep only last 60 seconds
+        cutoff = now - 60
+        while _request_times and _request_times[0] < cutoff:
+            _request_times.pop(0)
+        rps = len(_request_times) / 60.0
+    from metrics import REQUESTS_PER_SECOND
+    REQUESTS_PER_SECOND.set(rps)
+
 # ── Schemas ───────────────────────────────────────────────────
 class TransactionRequest(BaseModel):
-    # V1-V28 PCA features
     V1: float = 0.0;  V2: float = 0.0;  V3: float = 0.0
     V4: float = 0.0;  V5: float = 0.0;  V6: float = 0.0
     V7: float = 0.0;  V8: float = 0.0;  V9: float = 0.0
@@ -90,18 +113,14 @@ class TransactionRequest(BaseModel):
     V22: float = 0.0; V23: float = 0.0; V24: float = 0.0
     V25: float = 0.0; V26: float = 0.0; V27: float = 0.0
     V28: float = 0.0
-
-    # Transaction features
     Amount: float        = 100.0
     tx_count_1min: int   = 1
     tx_count_10min: int  = 3
     tx_count_60min: int  = 10
     hour: int            = 12
-
-    # Graph entity IDs
-    card_id: str     = "unknown"
-    merchant_id: str = "unknown"
-    ip: str          = "0.0.0.0"
+    card_id: str         = "unknown"
+    merchant_id: str     = "unknown"
+    ip: str              = "0.0.0.0"
 
 
 class FraudResponse(BaseModel):
@@ -120,32 +139,64 @@ class FraudResponse(BaseModel):
 
 @app.get("/health")
 def health():
-    uptime     = int(time.time() - START_TIME)
+    uptime      = int(time.time() - START_TIME)
     graph_stats = graph_detector.get_stats()
-    model_info  = get_model_info()
+    redis_up    = rate_limiter._redis_available
+    total       = max(stats["total_requests"], 1)
+    fraud_rate  = stats["fraud_detected"] / total * 100
+
+    # Update Prometheus gauges
+    update_system_state(
+        redis_up    = redis_up,
+        threshold   = model_info["threshold"],
+        graph_nodes = graph_stats["active_nodes"],
+        graph_edges = graph_stats["active_edges"],
+        fraud_rate  = fraud_rate
+    )
+
     return {
         "status":          "ok",
-        "version":         "5.0.0",
+        "version":         "6.0.0",
         "uptime":          f"{uptime//3600}h {(uptime%3600)//60}m {uptime%60}s",
-        "redis":           "connected" if rate_limiter._redis_available else "unavailable",
+        "redis":           "connected" if redis_up else "unavailable",
         "model":           model_info["model_type"],
         "threshold":       model_info["threshold"],
         "graph_nodes":     graph_stats["active_nodes"],
         "graph_edges":     graph_stats["active_edges"],
         "total_requests":  stats["total_requests"],
         "fraud_detected":  stats["fraud_detected"],
+        "fraud_rate_pct":  round(fraud_rate, 2),
         "approved":        stats["approved"],
         "blocked_by_rate": stats["blocked_rate"],
+        "prometheus":      "enabled — GET /metrics",
     }
 
 
 @app.get("/metrics")
 def metrics():
+    """Prometheus metrics endpoint — scraped every 15s by Prometheus."""
+    # Update gauges before serving
+    graph_stats = graph_detector.get_stats()
+    total       = max(stats["total_requests"], 1)
+    update_system_state(
+        redis_up    = rate_limiter._redis_available,
+        threshold   = model_info["threshold"],
+        graph_nodes = graph_stats["active_nodes"],
+        graph_edges = graph_stats["active_edges"],
+        fraud_rate  = stats["fraud_detected"] / total * 100
+    )
+    return Response(
+        content=get_metrics_output(),
+        media_type="text/plain; version=0.0.4; charset=utf-8"
+    )
+
+
+@app.get("/stats")
+def api_stats():
     total = max(stats["total_requests"], 1)
     return {
         "total_requests":      stats["total_requests"],
         "fraud_rate_pct":      round(stats["fraud_detected"] / total * 100, 2),
-        "graph_flag_rate_pct": round(stats["graph_flagged"]  / total * 100, 2),
         "approval_rate_pct":   round(stats["approved"]       / total * 100, 2),
         "rate_block_rate_pct": round(stats["blocked_rate"]   / total * 100, 2),
         "graph_stats":         graph_detector.get_stats(),
@@ -157,10 +208,7 @@ def metrics():
 @app.get("/graph/rings")
 def fraud_rings():
     rings = graph_detector.detect_rings()
-    return {
-        "total_rings": len(rings),
-        "rings":       rings
-    }
+    return {"total_rings": len(rings), "rings": rings}
 
 
 @app.get("/rate-limiter/status")
@@ -176,19 +224,31 @@ def check_fraud(tx: TransactionRequest, request: Request):
     start_time = time.time()
 
     stats["total_requests"] += 1
+    _track_request_rate()
 
-    # ── Phase 9: Dual-window rate limiter ─────────────────────
+    # ── Triple-layer rate limiter ─────────────────────────────
     allowed, reason = rate_limiter.is_allowed(client_ip, tx.card_id)
     if not allowed:
         stats["blocked_rate"] += 1
+
+        # Determine block type for Prometheus
+        if "Card limit" in reason:
+            block_type = "card_limit"
+        elif "Hourly" in reason:
+            block_type = "long_window"
+        else:
+            block_type = "short_window"
+
+        record_rate_limit(block_type)
         log_event("rate_limited", {
             "request_id": request_id,
             "client_ip":  client_ip,
+            "card_id":    tx.card_id,
             "reason":     reason
         })
         raise HTTPException(status_code=429, detail=reason)
 
-    # ── Build feature vector (all 39 features) ────────────────
+    # ── Build 39 features ────────────────────────────────────
     features = {
         **{f"V{i}": getattr(tx, f"V{i}") for i in range(1, 29)},
         "Amount":                 tx.Amount,
@@ -204,17 +264,15 @@ def check_fraud(tx: TransactionRequest, request: Request):
         "is_night":               1 if tx.hour < 5 else 0,
     }
 
-    # ── ML score ──────────────────────────────────────────────
+    # ── ML score ─────────────────────────────────────────────
     ml_score = score_transaction(features)
 
-    # ── Phase 8: Graph score (hardened — TTL + merchant rings) ─
+    # ── Graph score ───────────────────────────────────────────
     graph_score, graph_signals = graph_detector.score_transaction(
         card_id=tx.card_id,
         merchant_id=tx.merchant_id,
         ip_address=tx.ip
     )
-
-    # Add to graph for future transactions
     graph_detector.add_transaction(
         card_id=tx.card_id,
         merchant_id=tx.merchant_id,
@@ -222,12 +280,18 @@ def check_fraud(tx: TransactionRequest, request: Request):
         is_fraud=(ml_score > 0.5)
     )
 
-    # ── Combined score ────────────────────────────────────────
-    combined_score = round(0.6 * ml_score + 0.4 * graph_score, 4)
+    # Check for new rings
+    rings = graph_detector.detect_rings()
+    if rings:
+        record_ring_detected()
 
-    decision = decide(combined_score)
-    reasons  = explain(features, combined_score)
-    latency  = round((time.time() - start_time) * 1000, 2)
+    # ── Combined decision ─────────────────────────────────────
+    combined_score = round(0.6 * ml_score + 0.4 * graph_score, 4)
+    decision       = decide(combined_score)
+    reasons        = explain(features, combined_score)
+    shap_result    = shap_explain(features, top_n=5)
+    shap_reasons   = format_explanation(shap_result, decision)
+    latency        = round((time.time() - start_time) * 1000, 2)
 
     # ── Update stats ──────────────────────────────────────────
     if decision == "APPROVE":
@@ -241,7 +305,15 @@ def check_fraud(tx: TransactionRequest, request: Request):
     if graph_score > 0.3:
         stats["graph_flagged"] += 1
 
-    # ── Structured log ────────────────────────────────────────
+    # ── Record Prometheus metrics ─────────────────────────────
+    record_request(
+        decision  = decision,
+        latency_s = latency / 1000,
+        ml_score  = ml_score,
+        status    = "success"
+    )
+
+    # ── Log ───────────────────────────────────────────────────
     log_event("transaction_scored", {
         "request_id":  request_id,
         "client_ip":   client_ip,
@@ -260,7 +332,7 @@ def check_fraud(tx: TransactionRequest, request: Request):
         ml_score=round(ml_score, 4),
         graph_score=round(graph_score, 4),
         decision=decision,
-        explanation=reasons,
+        explanation=shap_reasons,
         graph_signals=graph_signals,
         rate_limiter="redis" if rate_limiter._redis_available else "in-memory",
         latency_ms=latency
