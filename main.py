@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from explainability import explain_transaction as shap_explain, format_explanation
+from ab_testing import start_experiment, stop_experiment, get_experiment
 from pydantic import BaseModel
 import numpy as np
 import time
@@ -217,6 +218,27 @@ def rate_limiter_status(request: Request):
     return rate_limiter.get_status(client_ip)
 
 
+@app.post("/ab-test/start")
+def ab_test_start(split_pct: float = 50.0, min_requests: int = 100):
+    exp = start_experiment(split_pct=split_pct, min_requests=min_requests)
+    return {"message": f"Experiment {exp.experiment_id} started",
+            "split": f"{100-split_pct:.0f}% A / {split_pct:.0f}% B"}
+
+@app.get("/ab-test/results")
+def ab_test_results():
+    exp = get_experiment()
+    if not exp:
+        return {"message": "No active experiment"}
+    return exp.get_results()
+
+@app.post("/ab-test/stop")
+def ab_test_stop():
+    results = stop_experiment()
+    if not results:
+        return {"message": "No active experiment to stop"}
+    return results
+
+
 @app.post("/fraud/check", response_model=FraudResponse)
 def check_fraud(tx: TransactionRequest, request: Request):
     request_id = str(uuid.uuid4())[:8]
@@ -313,6 +335,11 @@ def check_fraud(tx: TransactionRequest, request: Request):
         status    = "success"
     )
 
+    # ── A/B test recording ────────────────────────────────────
+    exp = get_experiment()
+    if exp and exp.active:
+        group = exp.assign_group(tx.card_id)
+        exp.record_result(tx.card_id, group, decision, latency, combined_score)
     # ── Log ───────────────────────────────────────────────────
     log_event("transaction_scored", {
         "request_id":  request_id,
