@@ -24,3 +24,6 @@ server_log.txt
 *.msi
 server_log.txt
 dump.rdb
+
+data/
+*.zip
