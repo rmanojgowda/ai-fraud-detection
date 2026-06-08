@@ -11,3 +11,9 @@ models/threshold_results.csv
 test_*.py
 gitignore
 models/threshold_analysis.json
+*.exe
+*.pdb
+*.dll
+*.msi
+server_log.txt
+*.conf
