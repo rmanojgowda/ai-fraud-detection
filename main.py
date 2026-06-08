@@ -7,6 +7,7 @@ from transaction_replay import save_for_replay, get_replay_system
 from geo_risk import score_geo_risk, get_geo_scorer, score_geo_risk_from_vfeatures
 from webhook_alerts import get_alert_system, send_fraud_ring_alert, send_high_risk_alert, send_rate_limit_alert
 from pydantic import BaseModel
+from redis_stream_processor import RedisStreamProcessor
 from async_processor import get_processor
 from velocity_decay import get_velocity_calculator, record_velocity, get_velocity_risk
 import numpy as np
@@ -75,6 +76,18 @@ log_event("startup", {
     "redis": "connected" if rate_limiter._redis_available else "unavailable"
 })
 log_event("startup", {"prometheus": "enabled", "metrics_path": "/metrics"})
+
+# ── Redis Streams Processor ───────────────────────────────────
+try:
+    _stream_processor = RedisStreamProcessor(
+        redis_client = rate_limiter._redis_client,
+        num_workers  = 4,
+        enable_shap  = True
+    )
+    log_event("startup", {"redis_streams": "enabled"})
+except Exception as e:
+    _stream_processor = None
+    log_event("startup", {"redis_streams": "unavailable", "error": str(e)})
 
 # ── Update Prometheus model threshold ────────────────────────
 from metrics import MODEL_THRESHOLD
@@ -285,6 +298,66 @@ def alert_history():
 @app.get("/velocity/stats")
 def velocity_stats():
     return get_velocity_calculator().get_stats()
+
+@app.post("/fraud/check/stream")
+async def check_fraud_stream(tx: TransactionRequest, request: Request):
+    request_id = str(uuid.uuid4())[:8]
+    client_ip  = request.client.host
+
+    # Rate limit
+    allowed, reason = rate_limiter.is_allowed(client_ip, tx.card_id)
+    if not allowed:
+        raise HTTPException(status_code=429, detail=reason)
+
+    if not _stream_processor:
+        raise HTTPException(status_code=503,
+                           detail="Stream processor unavailable")
+
+    features = {
+        **{f"V{i}": getattr(tx, f"V{i}") for i in range(1, 29)},
+        "Amount": tx.Amount,
+        "amount_log": np.log1p(tx.Amount),
+        "amount_sqrt": np.sqrt(tx.Amount),
+        "tx_count_1min": tx.tx_count_1min,
+        "tx_count_10min": tx.tx_count_10min,
+        "tx_count_60min": tx.tx_count_60min,
+        "amount_rolling_mean_1h": tx.Amount,
+        "amount_rolling_std_1h": 0.0,
+        "amount_deviation": 0.0,
+        "hour": tx.hour,
+        "is_night": 1 if tx.hour < 5 else 0,
+    }
+
+    _stream_processor.submit(
+        request_id=request_id, features=features,
+        card_id=tx.card_id, merchant_id=tx.merchant_id,
+        ip_address=tx.ip
+    )
+
+    return {
+        "request_id": request_id,
+        "status":     "queued",
+        "backend":    "redis_streams",
+        "poll_url":   f"/fraud/result/stream/{request_id}",
+        "message":    "Persisted to Redis Stream. Survives restarts."
+    }
+
+
+@app.get("/fraud/result/stream/{request_id}")
+async def get_stream_result(request_id: str):
+    if not _stream_processor:
+        raise HTTPException(status_code=503, detail="Unavailable")
+    result = _stream_processor.get_result(request_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Not found")
+    return result
+
+
+@app.get("/stream/stats")
+async def stream_stats():
+    if not _stream_processor:
+        return {"status": "unavailable"}
+    return _stream_processor.get_stats()
 
 @app.post("/fraud/check/async")
 async def check_fraud_async(tx: TransactionRequest, request: Request):
