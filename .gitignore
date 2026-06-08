@@ -17,3 +17,10 @@ models/threshold_analysis.json
 *.msi
 server_log.txt
 *.conf
+
+*.exe
+*.pdb
+*.dll
+*.msi
+server_log.txt
+dump.rdb
