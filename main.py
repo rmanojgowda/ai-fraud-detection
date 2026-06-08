@@ -8,6 +8,7 @@ from geo_risk import score_geo_risk, get_geo_scorer, score_geo_risk_from_vfeatur
 from webhook_alerts import get_alert_system, send_fraud_ring_alert, send_high_risk_alert, send_rate_limit_alert
 from pydantic import BaseModel
 from redis_stream_processor import RedisStreamProcessor
+from fastapi.middleware.gzip import GZipMiddleware
 from async_processor import get_processor
 from velocity_decay import get_velocity_calculator, record_velocity, get_velocity_risk
 import numpy as np
@@ -54,6 +55,8 @@ app = FastAPI(
     ),
     version="7.0.0"
 )
+
+app.add_middleware(GZipMiddleware, minimum_size=100)
 
 app.add_middleware(
     CORSMiddleware,

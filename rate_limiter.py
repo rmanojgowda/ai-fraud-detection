@@ -70,10 +70,12 @@ class DualWindowRateLimiter:
 
     def _connect_redis(self) -> bool:
         try:
-            client = redis.Redis(
+            pool = redis.ConnectionPool(
                 host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB,
+                max_connections=50,
                 socket_connect_timeout=1, socket_timeout=1
             )
+            client = redis.Redis(connection_pool=pool)
             client.ping()
             self._redis_client    = client
             self._redis_available = True
