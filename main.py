@@ -7,6 +7,7 @@ from transaction_replay import save_for_replay, get_replay_system
 from geo_risk import score_geo_risk, get_geo_scorer, score_geo_risk_from_vfeatures
 from webhook_alerts import get_alert_system, send_fraud_ring_alert, send_high_risk_alert, send_rate_limit_alert
 from pydantic import BaseModel
+from async_processor import get_processor
 from velocity_decay import get_velocity_calculator, record_velocity, get_velocity_risk
 import numpy as np
 import time
@@ -50,7 +51,7 @@ app = FastAPI(
         "Graph Ring Detection + Dual-Window + Card-Level Rate Limiting + "
         "Prometheus Metrics"
     ),
-    version="6.0.0"
+    version="7.0.0"
 )
 
 app.add_middleware(
@@ -285,8 +286,78 @@ def alert_history():
 def velocity_stats():
     return get_velocity_calculator().get_stats()
 
+@app.post("/fraud/check/async")
+async def check_fraud_async(tx: TransactionRequest, request: Request):
+    request_id = str(uuid.uuid4())[:8]
+    client_ip  = request.client.host
+
+    # Layer 1: Rate limit only (<1ms)
+    allowed, reason = rate_limiter.is_allowed(client_ip, tx.card_id)
+    if not allowed:
+        stats["blocked_rate"] += 1
+        raise HTTPException(status_code=429, detail=reason)
+
+    # Build features
+    features = {
+        **{f"V{i}": getattr(tx, f"V{i}") for i in range(1, 29)},
+        "Amount":                 tx.Amount,
+        "amount_log":             np.log1p(tx.Amount),
+        "amount_sqrt":            np.sqrt(tx.Amount),
+        "tx_count_1min":          tx.tx_count_1min,
+        "tx_count_10min":         tx.tx_count_10min,
+        "tx_count_60min":         tx.tx_count_60min,
+        "amount_rolling_mean_1h": tx.Amount,
+        "amount_rolling_std_1h":  0.0,
+        "amount_deviation":       0.0,
+        "hour":                   tx.hour,
+        "is_night":               1 if tx.hour < 5 else 0,
+    }
+
+    # Submit to background queue (non-blocking)
+    stats["total_requests"] += 1
+    get_processor().submit(
+        request_id  = request_id,
+        features    = features,
+        card_id     = tx.card_id,
+        merchant_id = tx.merchant_id,
+        ip_address  = tx.ip
+    )
+
+    # Return IMMEDIATELY — no ML blocking
+    return {
+        "request_id":  request_id,
+        "status":      "queued",
+        "poll_url":    f"/fraud/result/{request_id}",
+        "message":     "ML scoring in progress. Poll result URL."
+    }
+
+
+@app.get("/fraud/result/{request_id}")
+async def get_fraud_result(request_id: str):
+    result = get_processor().get_result(request_id)
+    if not result:
+        raise HTTPException(status_code=404,
+                           detail="Result not found or expired")
+    return {
+        "request_id":    result.request_id,
+        "status":        result.status,
+        "decision":      result.decision,
+        "risk_score":    result.combined_score,
+        "ml_score":      result.ml_score,
+        "graph_score":   result.graph_score,
+        "geo_score":     result.geo_score,
+        "explanation":   result.explanation,
+        "graph_signals": result.graph_signals,
+        "latency_ms":    result.latency_ms,
+    }
+
+
+@app.get("/async/stats")
+async def async_stats():
+    return get_processor().get_stats()
+
 @app.post("/fraud/check", response_model=FraudResponse)
-def check_fraud(tx: TransactionRequest, request: Request):
+async def check_fraud(tx: TransactionRequest, request: Request):
     request_id = str(uuid.uuid4())[:8]
     client_ip  = request.client.host
     start_time = time.time()
@@ -386,8 +457,14 @@ def check_fraud(tx: TransactionRequest, request: Request):
     )
     decision       = decide(combined_score)
     reasons        = explain(features, combined_score)
-    shap_result    = shap_explain(features, top_n=5)
-    shap_reasons   = format_explanation(shap_result, decision)
+    
+    # SHAP only on blocked — saves 5-10ms on 98% of requests
+    if decision in ["BLOCK", "STEP_UP_AUTH"]:
+        shap_result  = shap_explain(features, top_n=5)
+        shap_reasons = format_explanation(shap_result, decision)
+    else:
+        shap_reasons = [f"✅ APPROVED — combined score {combined_score:.4f}"]
+        
     latency        = round((time.time() - start_time) * 1000, 2)
 
     # ── Update stats ──────────────────────────────────────────
