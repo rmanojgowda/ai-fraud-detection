@@ -1,0 +1,109 @@
+name: CI — Fraud Detection Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+        cache: pip
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Test model loads correctly
+      run: |
+        python -c "
+        import joblib, json
+        model = joblib.load('models/fraud_model.pkl')
+        with open('models/feature_cols.json') as f:
+            cols = json.load(f)
+        with open('models/threshold.json') as f:
+            t = json.load(f)
+        assert len(cols) == 39, f'Expected 39 features, got {len(cols)}'
+        assert t['roc_auc'] > 0.98, f'ROC-AUC too low: {t[\"roc_auc\"]}'
+        print(f'Model OK: {t[\"model_type\"]} ROC-AUC={t[\"roc_auc\"]:.4f}')
+        "
+
+    - name: Test rate limiter
+      run: |
+        python -c "
+        from rate_limiter import DualWindowRateLimiter
+        limiter = DualWindowRateLimiter()
+        # Test basic allow
+        allowed, _ = limiter.is_allowed('10.0.0.1', 'card_001')
+        assert allowed, 'First request should be allowed'
+        print('Rate limiter OK')
+        "
+
+    - name: Test graph detector
+      run: |
+        python -c "
+        from graph_fraud import FraudGraphDetector
+        g = FraudGraphDetector(edge_ttl=3600)
+        g.add_transaction('card_001', 'merchant_A', '10.0.0.1')
+        score, signals = g.score_transaction('card_002', 'merchant_A', '10.0.0.1')
+        assert score > 0, 'Graph should detect shared IP'
+        print(f'Graph detector OK: score={score}')
+        "
+
+    - name: Test geo risk scorer
+      run: |
+        python -c "
+        from geo_risk import GeoRiskScorer
+        scorer = GeoRiskScorer(home_country='IN')
+        score, _ = scorer.score_transaction('card_001', 'RO', ip_address='10.8.0.1')
+        assert score > 0, 'Romania should have risk score'
+        score2, _ = scorer.score_transaction('card_002', 'IN')
+        assert score2 == 0, 'India should have zero risk'
+        print(f'Geo risk OK: RO={score}, IN={score2}')
+        "
+
+    - name: Test velocity decay
+      run: |
+        python -c "
+        from velocity_decay import VelocityDecayCalculator
+        import time
+        calc = VelocityDecayCalculator(decay_lambda=0.05)
+        for _ in range(5):
+            calc.record_transaction('card_attack')
+            time.sleep(0.1)
+        score, signals = calc.get_risk_score('card_attack', window_sec=60)
+        assert score > 0, 'Burst attack should have risk score'
+        print(f'Velocity decay OK: score={score}')
+        "
+
+    - name: Test API starts
+      run: |
+        python -c "
+        import subprocess, time, urllib.request, json, sys
+        proc = subprocess.Popen(
+            ['python', '-m', 'uvicorn', 'main:app',
+             '--host', '127.0.0.1', '--port', '8765'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        time.sleep(5)
+        try:
+            r = urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=5)
+            data = json.loads(r.read())
+            assert data['status'] == 'ok', f'Health check failed: {data}'
+            print(f'API OK: version={data[\"version\"]}')
+        finally:
+            proc.terminate()
+        "
+
+    - name: All tests passed
+      run: echo "✅ All CI tests passed!"
