@@ -7,6 +7,7 @@ from transaction_replay import save_for_replay, get_replay_system
 from geo_risk import score_geo_risk, get_geo_scorer, score_geo_risk_from_vfeatures
 from webhook_alerts import get_alert_system, send_fraud_ring_alert, send_high_risk_alert, send_rate_limit_alert
 from pydantic import BaseModel
+from redis_graph import RedisBackedFraudGraph
 from batch_processor import BatchRequest, BatchResponse, process_batch
 from redis_stream_processor import RedisStreamProcessor
 from fastapi.middleware.gzip import GZipMiddleware
@@ -66,10 +67,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ── Shared Instances ──────────────────────────────────────────
 graph_detector = FraudGraphDetector(edge_ttl=3600)
+
 rate_limiter   = DualWindowRateLimiter()
 model_info     = get_model_info()
+
+# Try Redis-backed shared graph first
+try:
+    graph_detector = RedisBackedFraudGraph(
+        redis_client = rate_limiter._redis_client,
+        edge_ttl     = 3600
+    )
+    log_event("startup", {"graph": "redis_shared"})
+except Exception:
+    graph_detector = FraudGraphDetector(edge_ttl=3600)
+    log_event("startup", {"graph": "in_memory_fallback"})
 
 log_event("startup", {"version": "7.0.0",
                        "model": model_info["model_type"],
