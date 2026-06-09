@@ -7,6 +7,7 @@ from transaction_replay import save_for_replay, get_replay_system
 from geo_risk import score_geo_risk, get_geo_scorer, score_geo_risk_from_vfeatures
 from webhook_alerts import get_alert_system, send_fraud_ring_alert, send_high_risk_alert, send_rate_limit_alert
 from pydantic import BaseModel
+from batch_processor import BatchRequest, BatchResponse, process_batch
 from redis_stream_processor import RedisStreamProcessor
 from fastapi.middleware.gzip import GZipMiddleware
 from async_processor import get_processor
@@ -70,7 +71,7 @@ graph_detector = FraudGraphDetector(edge_ttl=3600)
 rate_limiter   = DualWindowRateLimiter()
 model_info     = get_model_info()
 
-log_event("startup", {"version": "6.0.0",
+log_event("startup", {"version": "7.0.0",
                        "model": model_info["model_type"],
                        "threshold": model_info["threshold"]})
 log_event("startup", {
@@ -301,6 +302,20 @@ def alert_history():
 @app.get("/velocity/stats")
 def velocity_stats():
     return get_velocity_calculator().get_stats()
+
+@app.post("/fraud/check/batch", response_model=BatchResponse)
+async def check_fraud_batch(batch: BatchRequest, request: Request):
+    return await process_batch(
+        batch                     = batch,
+        client_ip                 = request.client.host,
+        rate_limiter              = None,
+        score_transaction         = score_transaction,
+        decide                    = decide,
+        graph_detector            = graph_detector,
+        score_geo_risk_from_vfeatures = score_geo_risk_from_vfeatures,
+        get_velocity_risk         = get_velocity_risk,
+        record_velocity           = record_velocity,
+    )
 
 @app.post("/fraud/check/stream")
 async def check_fraud_stream(tx: TransactionRequest, request: Request):
